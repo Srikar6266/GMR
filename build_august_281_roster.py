@@ -637,87 +637,317 @@ def _assign_abc_for_day(d, workers, need, prev_shifts):
 def _construct_shift_roster(a, b, c, R, n, label=""):
     """
     Build roster for n = A+B+C+R people.
-    - Week Off only after 6 work days when Reliever math allows (cycle=7)
-    - ~4–5 WO per person in a 31-day month
-    - Daily A/B/C at least plan counts; WO/day <= R
-    - No C→A
+    - Week Off after 6 work days when Reliever math allows (~4–5 WO / month)
+    - Rotate shifts inside the work block: prefer A,A,B,B,C,C then W/O (not same shift all week)
+    - Daily A/B/C at least plan; WO/day <= R
+    - No C→A; max 3 consecutive same A/B/C (prefer 2)
     """
-    need = {"A": a, "B": b, "C": c}
-    seq = [{d: None for d in range(DAYS)} for _ in range(n)]
-
     if R == 0:
-        # No reliever: fixed A/B/C all month (cannot give WO without breaking cover)
         pool = ["A"] * a + ["B"] * b + ["C"] * c
         assert len(pool) == n
-        for i, sh in enumerate(pool):
-            for d in range(DAYS):
-                seq[i][d] = sh
-        return seq
+        return [{d: sh for d in range(DAYS)} for sh in pool]
 
+    # Try ILP with fixed weekly WO + rotating work shifts
+    seq = _solve_rotating_ilp(a, b, c, R, n, label)
+    if seq is not None:
+        return seq
+    print(f"    ILP rotation fallback for {label}")
+    return _construct_shift_roster_heuristic(a, b, c, R, n, label)
+
+
+def _wo_masks(n, R):
+    """Return is_wo[i][d], phases, cycle for weekly (or fair longer) WO plan."""
     cycle = _ideal_cycle(n, R)
     phases = _assign_wo_phases(n, R, cycle)
-
-    # Place weekly / cyclic WOs
+    is_wo = [[False] * DAYS for _ in range(n)]
     wo_count = [0] * DAYS
     for i, ph in enumerate(phases):
         if ph is None:
             continue
         for d in range(DAYS):
             if d % cycle == ph:
-                seq[i][d] = "W/O"
+                is_wo[i][d] = True
                 wo_count[d] += 1
-
-    # People who did not get a phase: place WO with gap >= cycle on days with spare R capacity
     for i, ph in enumerate(phases):
         if ph is not None:
             continue
         last = -10**9
         for d in range(DAYS):
             if wo_count[d] < R and (d - last) >= cycle:
-                seq[i][d] = "W/O"
+                is_wo[i][d] = True
                 wo_count[d] += 1
                 last = d
+    return is_wo, phases, cycle
 
-    # Assign A/B/C on working days
+
+def _solve_rotating_ilp(a, b, c, R, n, label=""):
+    is_wo, phases, cycle = _wo_masks(n, R)
+    pref_block = ["A", "A", "B", "B", "C", "C"]
+
+    def preferred(i, d):
+        if is_wo[i][d] or cycle != 7 or phases[i] is None:
+            return None
+        dist = (d - phases[i] - 1) % cycle  # 0..5 on work days
+        return pref_block[dist]
+
+    try:
+        safe = re.sub(r"[^A-Za-z0-9]", "_", label)[:28]
+        prob = pulp.LpProblem(f"rot_{safe}", pulp.LpMinimize)
+        shifts = ["A", "B", "C"]
+        x = {
+            (i, d, s): pulp.LpVariable(f"x{i}_{d}_{s}", cat="Binary")
+            for i in range(n) for d in range(DAYS) for s in shifts
+            if not is_wo[i][d]
+        }
+        for i in range(n):
+            for d in range(DAYS):
+                if not is_wo[i][d]:
+                    prob += pulp.lpSum(x[i, d, s] for s in shifts) == 1
+
+        overs = []
+        for d in range(DAYS):
+            workers = [i for i in range(n) if not is_wo[i][d]]
+            for s, need in (("A", a), ("B", b), ("C", c)):
+                cnt = pulp.lpSum(x[i, d, s] for i in workers)
+                prob += cnt >= need
+                over = pulp.LpVariable(f"ov{d}_{s}", lowBound=0)
+                prob += cnt - need <= over
+                overs.append(4 * over)
+
+        # No C→A on consecutive work days
+        for i in range(n):
+            for d in range(DAYS - 1):
+                if is_wo[i][d] or is_wo[i][d + 1]:
+                    continue
+                prob += x[i, d, "C"] + x[i, d + 1, "A"] <= 1
+
+        # Hard: max 3 consecutive same shift
+        for i in range(n):
+            for s in shifts:
+                for d in range(DAYS - 3):
+                    if any(is_wo[i][d + k] for k in range(4)):
+                        continue
+                    prob += pulp.lpSum(x[i, d + k, s] for k in range(4)) <= 3
+
+        # Soft: max 2 consecutive (penalize 3-in-a-row)
+        for i in range(n):
+            for s in shifts:
+                for d in range(DAYS - 2):
+                    if any(is_wo[i][d + k] for k in range(3)):
+                        continue
+                    y3 = pulp.LpVariable(f"r3_{i}_{d}_{s}", cat="Binary")
+                    # y3 >= sum-2 roughly: force y3=1 if all three
+                    prob += pulp.lpSum(x[i, d + k, s] for k in range(3)) <= 2 + y3
+                    overs.append(6 * y3)
+
+        obj = list(overs)
+        for i in range(n):
+            for d in range(DAYS):
+                if is_wo[i][d]:
+                    continue
+                p = preferred(i, d)
+                if p in shifts:
+                    obj.append(-10 * x[i, d, p])
+            for d in range(DAYS - 1):
+                if is_wo[i][d] or is_wo[i][d + 1]:
+                    # After WO prefer A
+                    if is_wo[i][d] and not is_wo[i][d + 1]:
+                        obj.append(-5 * x[i, d + 1, "A"])
+                    # Before WO prefer C (AABBCC)
+                    if (not is_wo[i][d]) and is_wo[i][d + 1]:
+                        obj.append(-5 * x[i, d, "C"])
+                    continue
+                for s1, s2, w in [
+                    ("A", "A", -4), ("B", "B", -4), ("C", "C", -4),
+                    ("A", "B", -8), ("B", "C", -8),
+                    ("B", "A", 5), ("C", "B", 3), ("A", "C", 4),
+                ]:
+                    y = pulp.LpVariable(f"tr{i}_{d}_{s1}{s2}", cat="Binary")
+                    prob += y <= x[i, d, s1]
+                    prob += y <= x[i, d + 1, s2]
+                    obj.append(w * y)
+
+        prob += pulp.lpSum(obj)
+        tlim = 45 if n <= 8 else (90 if n <= 14 else 150)
+        st = pulp.LpStatus[prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=tlim))]
+        if st not in ("Optimal", "Feasible"):
+            return None
+
+        seq = []
+        for i in range(n):
+            s = {}
+            for d in range(DAYS):
+                if is_wo[i][d]:
+                    s[d] = "W/O"
+                else:
+                    for sh in shifts:
+                        if pulp.value(x[i, d, sh]) and pulp.value(x[i, d, sh]) > 0.5:
+                            s[d] = sh
+                            break
+            seq.append(s)
+        return seq
+    except Exception as e:
+        print(f"    ILP error {label}: {e}")
+        return None
+
+
+def _construct_shift_roster_heuristic(a, b, c, R, n, label=""):
+    """Heuristic fallback: weekly WO + greedy AABBCC-ish assignment with coverage repair."""
+    need = {"A": a, "B": b, "C": c}
+    is_wo, phases, cycle = _wo_masks(n, R)
+    seq = [{d: ("W/O" if is_wo[i][d] else None) for d in range(DAYS)} for i in range(n)]
+    pref_block = ["A", "A", "B", "B", "C", "C"]
+
     for d in range(DAYS):
-        workers = [i for i in range(n) if seq[i][d] != "W/O"]
-        if len(workers) < a + b + c:
-            # Emergency: cancel some WOs (latest placed among today) to restore cover
-            off_today = [i for i in range(n) if seq[i][d] == "W/O"]
-            while len(workers) < a + b + c and off_today:
-                i = off_today.pop()
-                seq[i][d] = None
-                wo_count[d] -= 1
-                workers.append(i)
-        prev = {i: (seq[i][d - 1] if d > 0 else None) for i in workers}
-        assigned = _assign_abc_for_day(d, workers, need, prev)
+        workers = [i for i in range(n) if not is_wo[i][d]]
+        # Desired letter from template
+        desire = {}
+        for i in workers:
+            if cycle == 7 and phases[i] is not None:
+                dist = (d - phases[i] - 1) % cycle
+                desire[i] = pref_block[dist]
+            else:
+                prev = seq[i][d - 1] if d > 0 else None
+                if prev in (None, "W/O"):
+                    desire[i] = "A"
+                elif prev == "A":
+                    desire[i] = "A"  # try 2nd A
+                elif prev == "B":
+                    desire[i] = "B"
+                else:
+                    desire[i] = "C"
+
+        assigned = {}
+        remaining = set(workers)
+        # Fill required counts preferring people who desire that shift
+        for sh in ("A", "B", "C"):
+            need_n = need[sh]
+            cand = sorted(
+                remaining,
+                key=lambda i: (
+                    0 if desire.get(i) == sh else 1,
+                    0 if (d == 0 or seq[i][d - 1] == sh) else 1,
+                    0 if (d == 0 or not (seq[i][d - 1] == "C" and sh == "A")) else 1,
+                    i,
+                ),
+            )
+            picked = []
+            for i in cand:
+                if len(picked) >= need_n:
+                    break
+                prev = seq[i][d - 1] if d > 0 else None
+                if prev == "C" and sh == "A":
+                    continue
+                # avoid 4th consecutive
+                if d >= 3 and sh == seq[i][d - 1] == seq[i][d - 2] == seq[i][d - 3]:
+                    continue
+                picked.append(i)
+            if len(picked) < need_n:
+                for i in cand:
+                    if i in picked:
+                        continue
+                    prev = seq[i][d - 1] if d > 0 else None
+                    if prev == "C" and sh == "A":
+                        continue
+                    picked.append(i)
+                    if len(picked) >= need_n:
+                        break
+            for i in picked:
+                assigned[i] = sh
+                remaining.discard(i)
+        for i in list(remaining):
+            prev = seq[i][d - 1] if d > 0 else None
+            if prev == "C":
+                assigned[i] = "C"
+            elif prev == "A":
+                assigned[i] = "B" if desire.get(i) != "A" else "A"
+            elif prev == "B":
+                assigned[i] = "C"
+            else:
+                assigned[i] = desire.get(i, "A")
         for i, sh in assigned.items():
             seq[i][d] = sh
 
-    # Repair any remaining C→A by swapping next-day assignments
+    # Repair C→A
     for i in range(n):
         for d in range(DAYS - 1):
             if seq[i][d] == "C" and seq[i][d + 1] == "A":
                 for j in range(n):
-                    if j == i:
-                        continue
-                    if seq[j][d + 1] in ("B", "C", "W/O"):
-                        # only swap if j isn't creating C→A and coverage letters stay valid enough
-                        if seq[j][d] == "C" and seq[i][d + 1] == "A":
-                            continue
+                    if seq[j][d + 1] in ("B", "C"):
                         seq[i][d + 1], seq[j][d + 1] = seq[j][d + 1], seq[i][d + 1]
                         if seq[i][d] == "C" and seq[i][d + 1] == "A":
                             seq[i][d + 1], seq[j][d + 1] = seq[j][d + 1], seq[i][d + 1]
                             continue
                         break
-                if seq[i][d] == "C" and seq[i][d + 1] == "A":
-                    # force stay on C / move to B via swap with a B
-                    for j in range(n):
-                        if seq[j][d + 1] == "B":
-                            seq[i][d + 1], seq[j][d + 1] = seq[j][d + 1], seq[i][d + 1]
-                            break
-
     return seq
+
+
+# Keep old helpers used by G-only path; remove unused _assign_abc if present via later cleanup
+def _assign_abc_for_day(d, workers, need, prev_shifts):
+    """Legacy helper retained for compatibility."""
+    a, b, c = need["A"], need["B"], need["C"]
+    remaining = list(workers)
+    assigned = {}
+
+    def ok(i, sh):
+        prev = prev_shifts.get(i)
+        if prev == "C" and sh == "A":
+            return False
+        return True
+
+    def score(i, sh):
+        prev = prev_shifts.get(i)
+        sc = 0
+        if prev == sh:
+            sc += 60
+        if sh == "B" and prev == "A":
+            sc += 45
+        if sh == "C" and prev == "B":
+            sc += 45
+        if sh == "A" and prev in ("W/O", None):
+            sc += 40
+        if prev == "C" and sh == "A":
+            sc -= 10000
+        return sc
+
+    for sh, need_n in (("A", a), ("B", b), ("C", c)):
+        cand = sorted(remaining, key=lambda i: score(i, sh), reverse=True)
+        picked = []
+        for i in cand:
+            if len(picked) >= need_n:
+                break
+            if ok(i, sh):
+                picked.append(i)
+        if len(picked) < need_n:
+            for i in cand:
+                if i in picked:
+                    continue
+                if ok(i, sh):
+                    picked.append(i)
+                if len(picked) >= need_n:
+                    break
+        if len(picked) < need_n:
+            for i in cand:
+                if i not in picked:
+                    picked.append(i)
+                if len(picked) >= need_n:
+                    break
+        for i in picked:
+            assigned[i] = sh
+            remaining.remove(i)
+    for i in remaining:
+        prev = prev_shifts.get(i)
+        if prev in (None, "W/O"):
+            assigned[i] = "A"
+        elif prev == "A":
+            assigned[i] = "A"
+        elif prev == "B":
+            assigned[i] = "B"
+        elif prev == "C":
+            assigned[i] = "C"
+        else:
+            assigned[i] = "B"
+    return assigned
 
 
 def solve_shift_team(plan, n_people, label=""):
@@ -1037,12 +1267,12 @@ def write_workbook(groups, slots, people, ca, issues):
     ws2.cell(r, 1, "RULES").font = Font(bold=True, color="C00000")
     r += 1
     for line in [
-        "1. Daily A/B/C headcount is AT LEAST the client plan for each designation (24x7). Extra hands may appear when weekly WO leaves spare capacity.",
-        "2. Reliever (R) = MAXIMUM people on Week Off that day for the shift team (covers absences).",
+        "1. Daily A/B/C headcount is AT LEAST the client plan for each designation (24x7).",
+        "2. Reliever (R) = MAXIMUM people on Week Off that day for the shift team.",
         "3. HARD: After C, next day is never A or G.",
-        "4. HARD Week Off rule: person works 6 days, then 1 Week Off (cycle 7) — about 4–5 WO in a 31-day month. NOT after 2–3 days.",
-        "5. Where Reliever×7 < shift team size, weekly off for ALL is impossible without cutting A/B/C; those teams use the next fair cycle.",
-        "6. Preferred work pattern inside the 6 days: A/A → B/B → C/C then W/O, then back to A.",
+        "4. HARD Week Off: 6 work days then 1 W/O (~4–5 WO in August). NOT after 2–3 days.",
+        "5. Shift rotation: inside the 6 work days prefer A,A → B,B → C,C then W/O (max 3 days on same shift). No one stays on A/B/C all month.",
+        "6. Where Reliever×7 < shift team size, weekly off for ALL is impossible without cutting cover; those teams use the next fair cycle.",
         "7. Electrical from Client Electrical + Sample; Civil from Client Civil Final; others from Client_Manpower_Requirement.",
         "8. Vacant rows left with blank Name/Contact for new joiners.",
         f"9. C→A/G violations: {ca}",
@@ -1135,26 +1365,38 @@ def main():
     for iss in issues[:40]:
         print(" ", iss)
 
-    # Spot-check WO frequency on a few roles
+    # Spot-check WO frequency + rotation on a few roles
     by_role = defaultdict(list)
     for s in slots:
         by_role[(s["section"], s["role"], s["area"])].append(s)
     for key in [("Mechanical & HVAC", "Shift Engineer", "MECH"),
                 ("Electrical", "Shift Engineer", "PTB"),
                 ("Mechanical & HVAC", "Technician (HVAC) L", "MECH"),
+                ("Mechanical & HVAC", "Plumber", "MECH"),
                 ("SCADA & Helpdesk", "Help Desk Executive", "APOC")]:
         ss = by_role.get(key, [])
         if not ss:
             continue
-        wos = [sum(1 for d in range(DAYS) if s["shifts"][d] == "W/O") for s in ss]
-        # min work between WOs
+        # skip pure G-only first rows for HVAC (G person is index 0 when plan has G)
+        check = [s for s in ss if any(s["shifts"][d] in ("A", "B", "C") for d in range(DAYS))]
+        if not check:
+            check = ss
+        wos = [sum(1 for d in range(DAYS) if s["shifts"][d] == "W/O") for s in check]
         gaps = []
-        for s in ss:
+        max_run = 0
+        for s in check:
             wdays = [d for d in range(DAYS) if s["shifts"][d] == "W/O"]
             for j in range(len(wdays) - 1):
                 gaps.append(wdays[j + 1] - wdays[j] - 1)
-        print(f"  CHECK {key}: WO/person={min(wos)}-{max(wos)} work_between_WO={min(gaps) if gaps else 'n/a'}-{max(gaps) if gaps else 'n/a'}")
-        print(f"    sample: {[ss[0]['shifts'][d] for d in range(14)]}")
+            cur = 1
+            for d in range(1, DAYS):
+                if s["shifts"][d] == s["shifts"][d - 1] and s["shifts"][d] in ("A", "B", "C"):
+                    cur += 1
+                    max_run = max(max_run, cur)
+                else:
+                    cur = 1
+        print(f"  CHECK {key}: WO={min(wos)}-{max(wos)} work_gap={min(gaps) if gaps else 'n/a'}-{max(gaps) if gaps else 'n/a'} max_same_shift_run={max_run}")
+        print(f"    sample: {[check[0]['shifts'][d] for d in range(21)]}")
 
     write_workbook(groups, slots, people, ca, issues)
 
