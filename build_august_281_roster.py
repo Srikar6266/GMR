@@ -489,8 +489,236 @@ def assign_people(groups, people):
 
 
 # ---------------------------------------------------------------------------
-# Shift generation
+# Shift generation — 6 work days then 1 Week Off (~4–5 WO / month)
+# Reliever (R) = max people on WO per day while keeping A/B/C covered.
 # ---------------------------------------------------------------------------
+
+def _ideal_cycle(n_shift, R):
+    """Return cycle length W for WO spacing. Ideal W=7 (6 work + 1 off)."""
+    if R <= 0 or n_shift <= 0:
+        return None
+    if R * 7 >= n_shift:
+        return 7
+    # Not enough relievers for everyone weekly — longest fair gap
+    return max(7, (n_shift + R - 1) // R)
+
+
+def _assign_wo_phases(n, R, cycle):
+    """Assign each person a WO phase in 0..cycle-1 with <=R people sharing a phase."""
+    if R <= 0 or cycle is None:
+        return [None] * n
+    load = [0] * cycle
+    phases = []
+    cap = cycle * R
+    for i in range(n):
+        if i >= cap:
+            phases.append(None)
+            continue
+        cand = [p for p in range(cycle) if load[p] < R]
+        if not cand:
+            phases.append(None)
+            continue
+        p = min(cand, key=lambda x: (load[x], x))
+        phases.append(p)
+        load[p] += 1
+    return phases
+
+
+def _g_only_roster(n_all, R):
+    """General-shift team: 6G + 1 WO staggered. Daily WO <= max(R, 1 if n>1 else 0) but prefer weekly."""
+    results = []
+    if n_all == 1:
+        # Single person: WO every 7th day (on-duty G dips that day)
+        seq = {d: ("W/O" if d % 7 == 6 else "G") for d in range(DAYS)}
+        return [seq]
+    # Use weekly phases; daily WO count = how many share that weekday phase ( <= ceil(n/7) )
+    # If R>0, cap WO/day at R; else cap at max(1, n//7) still giving weekly where possible
+    max_wo = R if R > 0 else max(1, (n_all + 6) // 7)
+    cycle = 7 if max_wo * 7 >= n_all else max(7, (n_all + max_wo - 1) // max_wo)
+    phases = _assign_wo_phases(n_all, max_wo, cycle)
+    for i, ph in enumerate(phases):
+        seq = {}
+        last = -10**9
+        for d in range(DAYS):
+            if ph is not None and d % cycle == ph:
+                seq[d] = "W/O"
+                last = d
+            else:
+                seq[d] = "G"
+        # Ensure long-cycle leftovers still get offs with gap>=cycle
+        if ph is None:
+            for d in range(DAYS):
+                if (d - last) >= cycle:
+                    # check day not overfull
+                    already = sum(1 for j in range(i) if results[j][d] == "W/O")
+                    if already < max_wo:
+                        seq[d] = "W/O"
+                        last = d
+        results.append(seq)
+    return results
+
+
+def _assign_abc_for_day(d, workers, need, prev_shifts):
+    """Assign A/B/C to workers for one day. Prefer AABBCC blocks & forward rotation; never C→A."""
+    a, b, c = need["A"], need["B"], need["C"]
+    remaining = list(workers)
+    assigned = {}
+
+    def ok(i, sh):
+        prev = prev_shifts.get(i)
+        if prev == "C" and sh == "A":
+            return False
+        return True
+
+    def score(i, sh):
+        prev = prev_shifts.get(i)
+        sc = 0
+        if prev == sh:
+            sc += 60  # continue 2-day block
+        if sh == "B" and prev == "A":
+            sc += 45
+        if sh == "C" and prev == "B":
+            sc += 45
+        if sh == "A" and prev in ("W/O", None):
+            sc += 40
+        if sh == "A" and prev == "B":
+            sc -= 25
+        if sh == "B" and prev == "C":
+            sc -= 25
+        if prev == "C" and sh == "A":
+            sc -= 10000
+        # count how many work days since last WO for mild AABBCC shaping
+        return sc
+
+    for sh, need_n in (("A", a), ("B", b), ("C", c)):
+        cand = sorted(remaining, key=lambda i: score(i, sh), reverse=True)
+        picked = []
+        for i in cand:
+            if len(picked) >= need_n:
+                break
+            if ok(i, sh):
+                picked.append(i)
+        # If short, take anyone legal
+        if len(picked) < need_n:
+            for i in cand:
+                if i in picked:
+                    continue
+                if ok(i, sh):
+                    picked.append(i)
+                if len(picked) >= need_n:
+                    break
+        # Last resort (should be rare): take even if C→A then fix later
+        if len(picked) < need_n:
+            for i in cand:
+                if i not in picked:
+                    picked.append(i)
+                if len(picked) >= need_n:
+                    break
+        for i in picked:
+            assigned[i] = sh
+            remaining.remove(i)
+
+    # Extras (overstrength when fewer than R are on WO): extend block, never C→A
+    for i in remaining:
+        prev = prev_shifts.get(i)
+        if prev in (None, "W/O"):
+            assigned[i] = "A"
+        elif prev == "A":
+            assigned[i] = "A"
+        elif prev == "B":
+            assigned[i] = "B"
+        elif prev == "C":
+            assigned[i] = "C"
+        else:
+            assigned[i] = "B"
+    return assigned
+
+
+def _construct_shift_roster(a, b, c, R, n, label=""):
+    """
+    Build roster for n = A+B+C+R people.
+    - Week Off only after 6 work days when Reliever math allows (cycle=7)
+    - ~4–5 WO per person in a 31-day month
+    - Daily A/B/C at least plan counts; WO/day <= R
+    - No C→A
+    """
+    need = {"A": a, "B": b, "C": c}
+    seq = [{d: None for d in range(DAYS)} for _ in range(n)]
+
+    if R == 0:
+        # No reliever: fixed A/B/C all month (cannot give WO without breaking cover)
+        pool = ["A"] * a + ["B"] * b + ["C"] * c
+        assert len(pool) == n
+        for i, sh in enumerate(pool):
+            for d in range(DAYS):
+                seq[i][d] = sh
+        return seq
+
+    cycle = _ideal_cycle(n, R)
+    phases = _assign_wo_phases(n, R, cycle)
+
+    # Place weekly / cyclic WOs
+    wo_count = [0] * DAYS
+    for i, ph in enumerate(phases):
+        if ph is None:
+            continue
+        for d in range(DAYS):
+            if d % cycle == ph:
+                seq[i][d] = "W/O"
+                wo_count[d] += 1
+
+    # People who did not get a phase: place WO with gap >= cycle on days with spare R capacity
+    for i, ph in enumerate(phases):
+        if ph is not None:
+            continue
+        last = -10**9
+        for d in range(DAYS):
+            if wo_count[d] < R and (d - last) >= cycle:
+                seq[i][d] = "W/O"
+                wo_count[d] += 1
+                last = d
+
+    # Assign A/B/C on working days
+    for d in range(DAYS):
+        workers = [i for i in range(n) if seq[i][d] != "W/O"]
+        if len(workers) < a + b + c:
+            # Emergency: cancel some WOs (latest placed among today) to restore cover
+            off_today = [i for i in range(n) if seq[i][d] == "W/O"]
+            while len(workers) < a + b + c and off_today:
+                i = off_today.pop()
+                seq[i][d] = None
+                wo_count[d] -= 1
+                workers.append(i)
+        prev = {i: (seq[i][d - 1] if d > 0 else None) for i in workers}
+        assigned = _assign_abc_for_day(d, workers, need, prev)
+        for i, sh in assigned.items():
+            seq[i][d] = sh
+
+    # Repair any remaining C→A by swapping next-day assignments
+    for i in range(n):
+        for d in range(DAYS - 1):
+            if seq[i][d] == "C" and seq[i][d + 1] == "A":
+                for j in range(n):
+                    if j == i:
+                        continue
+                    if seq[j][d + 1] in ("B", "C", "W/O"):
+                        # only swap if j isn't creating C→A and coverage letters stay valid enough
+                        if seq[j][d] == "C" and seq[i][d + 1] == "A":
+                            continue
+                        seq[i][d + 1], seq[j][d + 1] = seq[j][d + 1], seq[i][d + 1]
+                        if seq[i][d] == "C" and seq[i][d + 1] == "A":
+                            seq[i][d + 1], seq[j][d + 1] = seq[j][d + 1], seq[i][d + 1]
+                            continue
+                        break
+                if seq[i][d] == "C" and seq[i][d + 1] == "A":
+                    # force stay on C / move to B via swap with a B
+                    for j in range(n):
+                        if seq[j][d + 1] == "B":
+                            seq[i][d + 1], seq[j][d + 1] = seq[j][d + 1], seq[i][d + 1]
+                            break
+
+    return seq
+
 
 def solve_shift_team(plan, n_people, label=""):
     """Return list of dict day->shift for n_people covering plan A/B/C/G/R."""
@@ -502,183 +730,29 @@ def solve_shift_team(plan, n_people, label=""):
     n_g = need["G"]
     results = [None] * n_people
 
-    # Case: no A/B/C — everyone is General; R means that many WO per day (staggered)
+    # Pure G (+ optional R as G-reliever): weekly WO
     if a + b + c == 0:
-        n_all = n_g + R
-        assert n_all == n_people
-        # Exactly R people on WO each day (or 1 if R=0 and we still want weekly rest)
-        offs_per_day = R if R > 0 else (1 if n_all > 1 else 0)
-        for i in range(n_all):
-            seq = {}
-            for d in range(DAYS):
-                if offs_per_day == 0:
-                    # single G person: WO every 7th day
-                    seq[d] = "W/O" if (n_all == 1 and d % 7 == 6) else "G"
-                else:
-                    # rotating block of offs_per_day
-                    off_set = {(d * offs_per_day + k) % n_all for k in range(offs_per_day)}
-                    seq[d] = "W/O" if i in off_set else "G"
-            results[i] = seq
-        return results
+        return _g_only_roster(n_g + R, R)
 
-    # Mixed / pure shift teams
-    n_shift = a + b + c + R
-    # G staff first (staggered WO among G only)
+    # G staff first — weekly staggered WO (6G + 1WO)
     if n_g:
+        g_seqs = _g_only_roster(n_g, 0)  # among themselves, weekly
         for i in range(n_g):
-            seq = {}
-            for d in range(DAYS):
-                if n_g == 1:
-                    seq[d] = "W/O" if (d % 7 == 6) else "G"
-                else:
-                    seq[d] = "W/O" if (d % n_g == i) else "G"
-            results[i] = seq
+            results[i] = g_seqs[i]
 
+    n_shift = a + b + c + R
     if n_shift == 0:
         return results
 
     shift_idx = list(range(n_g, n_g + n_shift))
-
-    # Fixed ABC no reliever
-    if R == 0 and a + b + c == n_shift:
-        pool = ["A"] * a + ["B"] * b + ["C"] * c
-        for j, sh in enumerate(pool):
-            results[shift_idx[j]] = {d: sh for d in range(DAYS)}
-        return results
-
-    # Case: some A/B/C with R, possibly mixed with G already handled
-    # Special: Electrician L style G + B + R without full ABC — treat non-G as mini shift team
-    assign = _solve_ilp(a, b, c, R, n_shift, label)
-    if assign is None:
-        assign = _heuristic_roster(a, b, c, R, n_shift)
-
+    assign = _construct_shift_roster(a, b, c, R, n_shift, label=label)
     for j in range(n_shift):
         results[shift_idx[j]] = assign[j]
     return results
 
 
-def _solve_ilp(a, b, c, R, n, label):
-    need = {"A": a, "B": b, "C": c}
-    W = rest_window(n, R)
-    try:
-        prob = pulp.LpProblem(f"R_{re.sub(r'[^A-Za-z0-9]', '_', label)[:30]}", pulp.LpMinimize)
-        x = {(i, d, s): pulp.LpVariable(f"x{i}_{d}_{s}", cat="Binary")
-             for i in range(n) for d in range(DAYS) for s in ["A", "B", "C", "W/O"]}
-        for i in range(n):
-            for d in range(DAYS):
-                prob += pulp.lpSum(x[i, d, s] for s in ["A", "B", "C", "W/O"]) == 1
-        for d in range(DAYS):
-            for s in ["A", "B", "C"]:
-                prob += pulp.lpSum(x[i, d, s] for i in range(n)) == need[s]
-            if R > 0:
-                prob += pulp.lpSum(x[i, d, "W/O"] for i in range(n)) == R
-        # no C→A
-        for i in range(n):
-            for d in range(DAYS - 1):
-                prob += x[i, d, "C"] + x[i, d + 1, "A"] <= 1
-                # no consecutive WO when possible
-                if R * 2 <= n:  # enough people
-                    prob += x[i, d, "W/O"] + x[i, d + 1, "W/O"] <= 1
-        # fair WO
-        if R > 0:
-            total_wo = R * DAYS
-            base, rem = divmod(total_wo, n)
-            for i in range(n):
-                wc = pulp.lpSum(x[i, d, "W/O"] for d in range(DAYS))
-                if rem:
-                    prob += wc >= base
-                    prob += wc <= base + 1
-                else:
-                    prob += wc == base
-        if W is not None:
-            for i in range(n):
-                for start in range(0, DAYS - W + 1):
-                    prob += pulp.lpSum(x[i, start + k, "W/O"] for k in range(W)) >= 1
-        # soft prefer A→B→C→WO→A
-        obj = []
-        for i in range(n):
-            for d in range(DAYS - 1):
-                for s1, s2, w in [("A", "B", -10), ("B", "C", -10), ("C", "W/O", -12), ("W/O", "A", -8),
-                                  ("C", "B", 15), ("B", "A", 12)]:
-                    y = pulp.LpVariable(f"y{i}_{d}_{s1}_{s2}", cat="Binary")
-                    prob += y <= x[i, d, s1]
-                    prob += y <= x[i, d + 1, s2]
-                    obj.append(w * y)
-        prob += pulp.lpSum(obj)
-        # time limit scales with size
-        tlim = 30 if n <= 6 else (60 if n <= 12 else 120)
-        st = pulp.LpStatus[prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=tlim))]
-        if st not in ("Optimal", "Feasible"):
-            return None
-        out = []
-        for i in range(n):
-            seq = {}
-            for d in range(DAYS):
-                for s in ["A", "B", "C", "W/O"]:
-                    if pulp.value(x[i, d, s]) and pulp.value(x[i, d, s]) > 0.5:
-                        seq[d] = s
-                        break
-            out.append(seq)
-        return out
-    except Exception as e:
-        print("ILP fail", label, e)
-        return None
-
-
-def _heuristic_roster(a, b, c, R, n):
-    """Forward-cycle heuristic guaranteeing coverage and no C→A."""
-    # Classic: people cycle through positions in blocks.
-    # Build daily assignment lists.
-    people_seq = [{d: None for d in range(DAYS)} for _ in range(n)]
-    # Order people on a ring; each day take A,B,C from consecutive, next R off
-    # Rotate starting offset each day by 1 for fairness when R small, or by block.
-
-    # Better: use repeating pattern length = n
-    # Position roles in a circle of size n: first a are A, next b B, next c C, next R WO
-    # Each day rotate by 1.
-    base = ["A"] * a + ["B"] * b + ["C"] * c + ["W/O"] * R
-    assert len(base) == n
-    for d in range(DAYS):
-        rot = base[d % n:] + base[: d % n]
-        # Ensure no person gets C then A: check person i
-        # With rotate-by-1, person moves base[(i-d)%n] — transition from role at offset to offset-1
-        for i in range(n):
-            people_seq[i][d] = rot[i]
-
-    # Fix C→A violations by swapping with someone on B or WO next day
-    for i in range(n):
-        for d in range(DAYS - 1):
-            if people_seq[i][d] == "C" and people_seq[i][d + 1] == "A":
-                # find j with d+1 in {B, W/O, C} and preferably d != making new C→A
-                swapped = False
-                for j in range(n):
-                    if j == i:
-                        continue
-                    if people_seq[j][d + 1] in ("B", "W/O", "C"):
-                        # swap day d+1
-                        people_seq[i][d + 1], people_seq[j][d + 1] = people_seq[j][d + 1], people_seq[i][d + 1]
-                        # verify counts still ok automatically since swap
-                        if people_seq[i][d] == "C" and people_seq[i][d + 1] == "A":
-                            # revert
-                            people_seq[i][d + 1], people_seq[j][d + 1] = people_seq[j][d + 1], people_seq[i][d + 1]
-                            continue
-                        if d + 1 < DAYS - 1 and people_seq[j][d] == "C" and people_seq[j][d + 1] == "A":
-                            people_seq[i][d + 1], people_seq[j][d + 1] = people_seq[j][d + 1], people_seq[i][d + 1]
-                            continue
-                        swapped = True
-                        break
-                if not swapped:
-                    # force to WO or B by swapping with any B/WO
-                    for j in range(n):
-                        if people_seq[j][d + 1] in ("B", "W/O"):
-                            people_seq[i][d + 1], people_seq[j][d + 1] = people_seq[j][d + 1], people_seq[i][d + 1]
-                            break
-    return people_seq
-
-
 def generate_all_shifts(groups, slots):
     """Generate shifts per group and attach to slots."""
-    # group slots by gi
     by_gi = defaultdict(list)
     for si, slot in enumerate(slots):
         by_gi[slot["gi"]].append(si)
@@ -688,19 +762,22 @@ def generate_all_shifts(groups, slots):
         assert len(sis) == g["required"]
         plan = g["plan"]
         label = f"{g['section']}_{g['area']}_{g['role']}"
-        print(f"  Roster {label}: n={g['required']} plan={plan}")
+        n_shift = plan["A"] + plan["B"] + plan["C"] + plan["R"]
+        cycle = _ideal_cycle(n_shift, plan["R"]) if n_shift else 7
+        print(f"  Roster {label}: n={g['required']} plan={plan} WO_cycle={cycle}")
         seqs = solve_shift_team(plan, g["required"], label=label)
         for j, si in enumerate(sis):
             slots[si]["shifts"] = seqs[j]
-            # validate no C→A/G for this person
             for d in range(DAYS - 1):
                 if seqs[j][d] == "C" and seqs[j][d + 1] in ("A", "G"):
                     print(f"    WARN C→{seqs[j][d+1]} in {label} person {j} day {d+1}")
 
 
 def validate_coverage(groups, slots):
+    """Validate: A/B/C >= plan, shift WO <= R, no C→A/G, WO gaps (>=6 work) where math allows."""
     issues = []
     ca = 0
+    short_gaps = 0
     by_gi = defaultdict(list)
     for slot in slots:
         by_gi[slot["gi"]].append(slot)
@@ -712,32 +789,44 @@ def validate_coverage(groups, slots):
 
     for gi, g in enumerate(groups):
         plan = g["plan"]
+        n_g = plan["G"]
+        n_shift = plan["A"] + plan["B"] + plan["C"] + plan["R"]
+        cycle = _ideal_cycle(n_shift, plan["R"]) if n_shift and plan["R"] else 7
+        min_work = (cycle - 1) if cycle else 6
+
         for d in range(DAYS):
-            cnt = Counter(slots[si]["shifts"][d] for si in range(len(slots)) if slots[si]["gi"] == gi)
-            # recount via by_gi
             cnt = Counter(s["shifts"][d] for s in by_gi[gi])
             for s in ["A", "B", "C"]:
-                if cnt[s] != plan[s]:
-                    issues.append(f"COV {g['role']}/{g['area']} day{d+1} {s}={cnt[s]} want {plan[s]}")
-            # G on-duty may be plan G or plan G-1 when staggered WO among G-only or mixed
-            # For mixed G+shift, G people are first n_g — their WO reduces G count
-            # Accept G count between max(0, planG-1) and planG when G staff stagger
-            if plan["G"]:
-                if cnt["G"] > plan["G"] or cnt["G"] < max(0, plan["G"] - (1 if plan["G"] else 0)):
-                    # only flag if wildly off
-                    if abs(cnt["G"] - plan["G"]) > 1:
-                        issues.append(f"GCOV {g['role']} day{d+1} G={cnt['G']} plan={plan['G']}")
-            if plan["R"]:
-                if cnt["W/O"] != plan["R"] + (1 if plan["G"] > 1 and False else 0):
-                    # shift WO should equal R; G WO is extra among G staff
-                    # Count WO among shift people only
-                    n_g = plan["G"]
+                if plan[s] and cnt[s] < plan[s]:
+                    issues.append(f"UNDER {g['role']}/{g['area']} day{d+1} {s}={cnt[s]} want>={plan[s]}")
+            # Shift-team WO must not exceed R
+            if n_shift:
+                shift_slots = by_gi[gi][n_g:] if (plan["A"] + plan["B"] + plan["C"]) else by_gi[gi]
+                # For mixed teams G are first n_g
+                if plan["A"] + plan["B"] + plan["C"] > 0:
                     shift_slots = by_gi[gi][n_g:]
-                    wo_shift = sum(1 for s in shift_slots if s["shifts"][d] == "W/O")
-                    if wo_shift != plan["R"]:
-                        issues.append(f"WO {g['role']}/{g['area']} day{d+1} shiftWO={wo_shift} want R={plan['R']}")
+                else:
+                    shift_slots = by_gi[gi]
+                wo_shift = sum(1 for s in shift_slots if s["shifts"][d] == "W/O")
+                if plan["R"] and wo_shift > plan["R"]:
+                    issues.append(f"WO>{plan['R']} {g['role']}/{g['area']} day{d+1} WO={wo_shift}")
 
-    return ca, issues
+        # Gap check on shift people
+        check_slots = by_gi[gi][n_g:] if (plan["A"] + plan["B"] + plan["C"] > 0) else by_gi[gi]
+        if plan["R"] == 0 and plan["A"] + plan["B"] + plan["C"] > 0:
+            continue  # fixed shifts, no WO expected
+        for s in check_slots:
+            wos = [d for d in range(DAYS) if s["shifts"][d] == "W/O"]
+            for j in range(len(wos) - 1):
+                gap = wos[j + 1] - wos[j] - 1
+                if gap < min_work:
+                    short_gaps += 1
+                    if short_gaps <= 15:
+                        issues.append(
+                            f"SHORT_GAP {s['client_req']} work_between_WO={gap} want>={min_work}"
+                        )
+
+    return ca, issues, short_gaps
 
 
 # ---------------------------------------------------------------------------
@@ -918,19 +1007,19 @@ def write_workbook(groups, slots, people, ca, issues):
         plan = g["plan"]
         filled = filled_by_gi[gi]
         n_shift = plan["A"] + plan["B"] + plan["C"] + plan["R"]
-        W = rest_window(n_shift, plan["R"]) if n_shift else None
+        cycle = _ideal_cycle(n_shift, plan["R"]) if n_shift else None
         if plan["R"] == 0 and n_shift:
-            note = "No reliever — fixed A/B/C (no WO) to keep 24x7 cover"
+            note = "No reliever — fixed A/B/C (cannot give WO without breaking cover)"
             Wstr = "N/A"
-        elif W == 7:
-            note = "6 work + 1 WO hard target"
-            Wstr = 7
-        elif W:
-            note = f"Reliever short for weekly off all; WO every {W} days"
-            Wstr = W
+        elif cycle == 7:
+            note = "6 work days + 1 Week Off (~4–5 WO in Aug). Daily A/B/C >= plan; WO/day <= R"
+            Wstr = "7 (6+1)"
+        elif cycle:
+            note = f"Reliever×7 < team — cannot give EVERYONE weekly off; WO every {cycle} days (stretch {cycle-1})"
+            Wstr = str(cycle)
         else:
-            note = "General shift staggered WO"
-            Wstr = "G-stag"
+            note = "General shift: 6G + 1 WO staggered"
+            Wstr = "7 (G)"
         vals = [g["section"], g["area"], g["role"], plan["G"], plan["A"], plan["B"], plan["C"],
                 plan["R"], g["required"], filled, g["required"] - filled, Wstr, note]
         for col, v in enumerate(vals, 1):
@@ -948,15 +1037,15 @@ def write_workbook(groups, slots, people, ca, issues):
     ws2.cell(r, 1, "RULES").font = Font(bold=True, color="C00000")
     r += 1
     for line in [
-        "1. Daily A/B/C headcount matches the plan for each designation group (24x7).",
-        "2. Reliever (R) = number of people on W/O that day among the shift team.",
+        "1. Daily A/B/C headcount is AT LEAST the client plan for each designation (24x7). Extra hands may appear when weekly WO leaves spare capacity.",
+        "2. Reliever (R) = MAXIMUM people on Week Off that day for the shift team (covers absences).",
         "3. HARD: After C, next day is never A or G.",
-        "4. Preferred rotation A → B → C → W/O → A.",
-        "5. Where Reliever×7 ≥ shift team size → everyone gets ≥1 Week Off in every 7 days.",
-        "6. Electrical follows Client Electrical / Sample (not Client_Manpower Electrical rollup).",
-        "7. Civil follows Client Civil Final Requirement ALS & PTB (57).",
-        "8. Vacant rows left with blank Name/Contact so new joiners can be filled later.",
-        f"9. C→A/G violations in generated roster: {ca}",
+        "4. HARD Week Off rule: person works 6 days, then 1 Week Off (cycle 7) — about 4–5 WO in a 31-day month. NOT after 2–3 days.",
+        "5. Where Reliever×7 < shift team size, weekly off for ALL is impossible without cutting A/B/C; those teams use the next fair cycle.",
+        "6. Preferred work pattern inside the 6 days: A/A → B/B → C/C then W/O, then back to A.",
+        "7. Electrical from Client Electrical + Sample; Civil from Client Civil Final; others from Client_Manpower_Requirement.",
+        "8. Vacant rows left with blank Name/Contact for new joiners.",
+        f"9. C→A/G violations: {ca}",
         f"10. Unassigned Existing people: {sum(1 for p in people if not p['used'])}",
     ]:
         ws2.cell(r, 1, line)
@@ -1041,10 +1130,31 @@ def main():
 
     print("Generating shifts...")
     generate_all_shifts(groups, slots)
-    ca, issues = validate_coverage(groups, slots)
-    print(f"Validation C→A/G={ca} coverage_issues={len(issues)}")
-    for iss in issues[:30]:
+    ca, issues, short_gaps = validate_coverage(groups, slots)
+    print(f"Validation C→A/G={ca} short_WO_gaps={short_gaps} issues={len(issues)}")
+    for iss in issues[:40]:
         print(" ", iss)
+
+    # Spot-check WO frequency on a few roles
+    by_role = defaultdict(list)
+    for s in slots:
+        by_role[(s["section"], s["role"], s["area"])].append(s)
+    for key in [("Mechanical & HVAC", "Shift Engineer", "MECH"),
+                ("Electrical", "Shift Engineer", "PTB"),
+                ("Mechanical & HVAC", "Technician (HVAC) L", "MECH"),
+                ("SCADA & Helpdesk", "Help Desk Executive", "APOC")]:
+        ss = by_role.get(key, [])
+        if not ss:
+            continue
+        wos = [sum(1 for d in range(DAYS) if s["shifts"][d] == "W/O") for s in ss]
+        # min work between WOs
+        gaps = []
+        for s in ss:
+            wdays = [d for d in range(DAYS) if s["shifts"][d] == "W/O"]
+            for j in range(len(wdays) - 1):
+                gaps.append(wdays[j + 1] - wdays[j] - 1)
+        print(f"  CHECK {key}: WO/person={min(wos)}-{max(wos)} work_between_WO={min(gaps) if gaps else 'n/a'}-{max(gaps) if gaps else 'n/a'}")
+        print(f"    sample: {[ss[0]['shifts'][d] for d in range(14)]}")
 
     write_workbook(groups, slots, people, ca, issues)
 
